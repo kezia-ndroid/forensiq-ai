@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="lensGrad" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#EC4899" />
+      <stop offset="50%" stop-color="#D946EF" />
+      <stop offset="100%" stop-color="#8B5CF6" />
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="6" y1="6" x2="26" y2="26" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F472B6" />
+      <stop offset="100%" stop-color="#A855F7" />
+    </linearGradient>
+  </defs>
+  <!-- Outer Shield ring -->
+  <path d="M16 3L5 7V14C5 21.5 9.8 28.1 16 30C22.2 28.1 27 21.5 27 14V7L16 3Z" stroke="url(#lensGrad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Focus aperture circle -->
+  <circle cx="16" cy="15" r="6" stroke="url(#shieldGrad)" stroke-width="2" stroke-dasharray="3 2" />
+  <!-- Center focal point -->
+  <circle cx="16" cy="15" r="2" fill="#EC4899" />
+  <!-- Crosshairs -->
+  <path d="M16 6V9M16 21V24M7 15H10M22 15H25" stroke="#D946EF" stroke-width="1.5" stroke-linecap="round" />
+</svg>
