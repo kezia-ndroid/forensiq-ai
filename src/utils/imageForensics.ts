@@ -29,17 +29,59 @@ export interface ColorBalanceResult {
   meanG: number;
   meanB: number;
   channelDiscrepancy: number;  // Avg difference between R, G, B
+  meanSaturationPct: number;
 }
 
 export interface SpatialNoiseResult {
   overallVariance: number;
   quadrantVariances: [number, number, number, number]; // TL, TR, BL, BR
   varianceRatio: number;      // max variance / min variance (clamped)
+  meanGradient: number;       // Mean local luminance gradient magnitude
+  edgeDensityPct: number;     // Share of sampled pixels with strong local edges
 }
+
+const GENERATIVE_HEADER_SIGNATURES: Array<{ needle: string; label: string }> = [
+  { needle: 'midjourney', label: 'Midjourney' },
+  { needle: 'dall-e', label: 'DALL-E' },
+  { needle: 'dall·e', label: 'DALL-E' },
+  { needle: 'dall e', label: 'DALL-E' },
+  { needle: 'stable diffusion', label: 'Stable Diffusion' },
+  { needle: 'stablediffusion', label: 'Stable Diffusion' },
+  { needle: 'automatic1111', label: 'Stable Diffusion WebUI' },
+  { needle: 'comfyui', label: 'ComfyUI' },
+  { needle: 'invokeai', label: 'InvokeAI' },
+  { needle: 'novelai', label: 'NovelAI' },
+  { needle: 'dreamstudio', label: 'DreamStudio' },
+  { needle: 'adobe firefly', label: 'Adobe Firefly' },
+  { needle: 'generativefill', label: 'Adobe Generative Fill' },
+  { needle: 'generative fill', label: 'Adobe Generative Fill' },
+  { needle: 'leonardo.ai', label: 'Leonardo' },
+  { needle: 'negative prompt', label: 'Diffusion Metadata (Prompt/Parameters Chunk)' },
+];
+
+const collectGenerativeSoftwareTags = (headerText: string): string[] => {
+  const lower = headerText.toLowerCase();
+  const detected: string[] = [];
+  for (const signature of GENERATIVE_HEADER_SIGNATURES) {
+    if (lower.includes(signature.needle) && !detected.includes(signature.label)) {
+      detected.push(signature.label);
+    }
+  }
+  if (
+    (lower.includes('parameters') && (lower.includes('steps:') || lower.includes('sampler'))) ||
+    lower.includes('negative prompt')
+  ) {
+    if (!detected.includes('Diffusion Metadata (Prompt/Parameters Chunk)')) {
+      detected.push('Diffusion Metadata (Prompt/Parameters Chunk)');
+    }
+  }
+  return detected;
+};
 
 export interface ExperimentalCompressionResult {
   compressionDelta: number;   // Average difference in re-compression
   isUniform: boolean;
+  isApplicable: boolean;
 }
 
 /**
@@ -76,15 +118,23 @@ export const inspectImageHeader = async (file: File): Promise<HeaderInspectionRe
     const buffer = await slice.arrayBuffer();
     const bytes = new Uint8Array(buffer);
 
+    const headerText = new TextDecoder('latin1', { fatal: false }).decode(bytes);
+
     // Check for JPEG: FF D8
     if (bytes[0] === 0xff && bytes[1] === 0xd8) {
       let hasExif = false;
       let pos = 2;
-      const detectedSoftware: string[] = [];
 
       while (pos < bytes.length - 4) {
-        if (bytes[pos] === 0xff && bytes[pos + 1] === 0xe1) {
-          // APP1 Marker (EXIF)
+        if (bytes[pos] !== 0xff) {
+          pos++;
+          continue;
+        }
+        const marker = bytes[pos + 1];
+        if (marker === 0xda) {
+          break;
+        }
+        if (marker === 0xe1) {
           const markerStr = String.fromCharCode(
             bytes[pos + 4],
             bytes[pos + 5],
@@ -94,31 +144,33 @@ export const inspectImageHeader = async (file: File): Promise<HeaderInspectionRe
           if (markerStr === 'Exif') {
             hasExif = true;
           }
-          break;
+        }
+        if (marker >= 0xe0 && marker <= 0xef && pos + 3 < bytes.length) {
+          const segmentLen = (bytes[pos + 2] << 8) | bytes[pos + 3];
+          pos += 2 + Math.max(segmentLen, 2);
+          continue;
         }
         pos++;
       }
+
+      const detectedSoftware = collectGenerativeSoftwareTags(headerText);
 
       return {
         hasExif,
         format: 'jpeg',
         detectedSoftware: detectedSoftware.length > 0 ? detectedSoftware : undefined,
-        summary: hasExif
-          ? 'Standard EXIF camera metadata structure detected.'
-          : 'No standard EXIF markers found (standard for web/shared images).',
+        summary: detectedSoftware.length > 0
+          ? `JPEG header contained generative software markers: ${detectedSoftware.join(', ')}`
+          : hasExif
+            ? 'Standard EXIF camera metadata structure detected.'
+            : 'No standard EXIF markers found (standard for web/shared images).',
       };
     }
 
     // Check for PNG: 89 50 4E 47
     if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
-      const textDecoder = new TextDecoder('utf-8', { fatal: false });
-      const fullText = textDecoder.decode(bytes);
-      const detectedSoftware: string[] = [];
-
-      if (fullText.includes('parameters') || fullText.includes('Negative prompt') || fullText.includes('Steps:')) {
-        detectedSoftware.push('Diffusion Metadata (Prompt/Parameters Chunk)');
-      }
-      if (fullText.includes('ComfyUI') || fullText.includes('workflow')) {
+      const detectedSoftware = collectGenerativeSoftwareTags(headerText);
+      if (headerText.toLowerCase().includes('workflow') && !detectedSoftware.includes('ComfyUI')) {
         detectedSoftware.push('ComfyUI Workflow Metadata');
       }
 
@@ -134,10 +186,14 @@ export const inspectImageHeader = async (file: File): Promise<HeaderInspectionRe
 
     // Check for WEBP: 'RIFF' .... 'WEBP'
     if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+      const detectedSoftware = collectGenerativeSoftwareTags(headerText);
       return {
-        hasExif: false,
+        hasExif: headerText.includes('Exif'),
         format: 'webp',
-        summary: 'Standard WebP container format detected.',
+        detectedSoftware: detectedSoftware.length > 0 ? detectedSoftware : undefined,
+        summary: detectedSoftware.length > 0
+          ? `WebP header contained generative software markers: ${detectedSoftware.join(', ')}`
+          : 'Standard WebP container format detected.',
       };
     }
 
@@ -215,13 +271,14 @@ export const calculateColorChannelBalance = (
 ): ColorBalanceResult => {
   const totalPixels = pixels.length / 4;
   if (totalPixels === 0) {
-    return { meanR: 128, meanG: 128, meanB: 128, channelDiscrepancy: 0 };
+    return { meanR: 128, meanG: 128, meanB: 128, channelDiscrepancy: 0, meanSaturationPct: 0 };
   }
 
   let sumR = 0;
   let sumG = 0;
   let sumB = 0;
   let sumDiff = 0;
+  let sumSat = 0;
 
   for (let i = 0; i < pixels.length; i += 4) {
     const r = pixels[i];
@@ -233,6 +290,9 @@ export const calculateColorChannelBalance = (
     // Difference between channels
     const diff = (Math.abs(r - g) + Math.abs(g - b) + Math.abs(b - r)) / 3;
     sumDiff += diff;
+    const maxC = Math.max(r, g, b);
+    const minC = Math.min(r, g, b);
+    sumSat += (maxC - minC) / 255;
   }
 
   return {
@@ -240,6 +300,7 @@ export const calculateColorChannelBalance = (
     meanG: Math.round((sumG / totalPixels) * 10) / 10,
     meanB: Math.round((sumB / totalPixels) * 10) / 10,
     channelDiscrepancy: Math.round((sumDiff / totalPixels) * 10) / 10,
+    meanSaturationPct: Math.round((sumSat / totalPixels) * 1000) / 10,
   };
 };
 
@@ -252,7 +313,13 @@ export const calculateSpatialNoiseConsistency = (
   height: number
 ): SpatialNoiseResult => {
   if (width < 8 || height < 8) {
-    return { overallVariance: 0, quadrantVariances: [0, 0, 0, 0], varianceRatio: 1.0 };
+    return {
+      overallVariance: 0,
+      quadrantVariances: [0, 0, 0, 0],
+      varianceRatio: 1.0,
+      meanGradient: 0,
+      edgeDensityPct: 0,
+    };
   }
 
   const halfW = Math.floor(width / 2);
@@ -260,6 +327,10 @@ export const calculateSpatialNoiseConsistency = (
 
   // Quadrants: 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Bottom-Right
   const quadVariances: [number, number, number, number] = [0, 0, 0, 0];
+
+  let gradientSum = 0;
+  let gradientSamples = 0;
+  let strongEdgeCount = 0;
 
   const computeQuadrantVariance = (startX: number, startY: number, endX: number, endY: number): number => {
     let sumGrad = 0;
@@ -281,6 +352,11 @@ export const calculateSpatialNoiseConsistency = (
         const grad = Math.abs(lumRight - lum) + Math.abs(lumDown - lum);
         grads.push(grad);
         sumGrad += grad;
+        gradientSum += grad;
+        gradientSamples++;
+        if (grad > 18) {
+          strongEdgeCount++;
+        }
         count++;
       }
     }
@@ -310,10 +386,17 @@ export const calculateSpatialNoiseConsistency = (
     ratio = Math.round((maxVar / Math.max(minVar, 0.1)) * 10) / 10;
   }
 
+  const meanGradient =
+    gradientSamples > 0 ? Math.round((gradientSum / gradientSamples) * 100) / 100 : 0;
+  const edgeDensityPct =
+    gradientSamples > 0 ? Math.round((strongEdgeCount / gradientSamples) * 1000) / 10 : 0;
+
   return {
     overallVariance: Math.round(overall * 10) / 10,
     quadrantVariances: quadVariances,
     varianceRatio: Math.min(ratio, 50.0),
+    meanGradient,
+    edgeDensityPct,
   };
 };
 
@@ -328,8 +411,14 @@ export const calculateExperimentalRecompressionDelta = async (
   canvas: HTMLCanvasElement,
   ctx: CanvasRenderingContext2D,
   width: number,
-  height: number
+  height: number,
+  sourceFormat: HeaderInspectionResult['format']
 ): Promise<ExperimentalCompressionResult> => {
+  // Re-encoding PNG/WebP to JPEG always creates large residuals — not a reliable indicator.
+  if (sourceFormat !== 'jpeg') {
+    return { compressionDelta: 0, isUniform: true, isApplicable: false };
+  }
+
   try {
     const originalData = ctx.getImageData(0, 0, width, height).data;
 
@@ -348,7 +437,7 @@ export const calculateExperimentalRecompressionDelta = async (
     offCanvas.height = height;
     const offCtx = offCanvas.getContext('2d');
     if (!offCtx) {
-      return { compressionDelta: 0, isUniform: true };
+      return { compressionDelta: 0, isUniform: true, isApplicable: false };
     }
 
     offCtx.drawImage(tempImg, 0, 0, width, height);
@@ -370,11 +459,13 @@ export const calculateExperimentalRecompressionDelta = async (
     return {
       compressionDelta: Math.round(avgDiff * 100) / 100,
       isUniform: avgDiff < 8.0,
+      isApplicable: true,
     };
   } catch {
     return {
       compressionDelta: 0,
       isUniform: true,
+      isApplicable: false,
     };
   }
 };

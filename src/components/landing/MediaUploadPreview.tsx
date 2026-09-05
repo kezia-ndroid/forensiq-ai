@@ -52,6 +52,15 @@ export const MediaUploadPreview: React.FC = () => {
 
   // Object URL cleanup tracker to prevent memory leaks
   const currentObjectUrlRef = useRef<string | null>(null);
+  const reportPreviewUrlRef = useRef<string | null>(null);
+  const analysisGenerationRef = useRef(0);
+
+  const revokeReportPreview = () => {
+    if (reportPreviewUrlRef.current && reportPreviewUrlRef.current !== currentObjectUrlRef.current) {
+      URL.revokeObjectURL(reportPreviewUrlRef.current);
+    }
+    reportPreviewUrlRef.current = null;
+  };
 
   const cleanupCurrentObjectUrl = () => {
     if (currentObjectUrlRef.current) {
@@ -63,6 +72,7 @@ export const MediaUploadPreview: React.FC = () => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      revokeReportPreview();
       cleanupCurrentObjectUrl();
     };
   }, []);
@@ -94,7 +104,10 @@ export const MediaUploadPreview: React.FC = () => {
       return;
     }
 
+    analysisGenerationRef.current += 1;
+    revokeReportPreview();
     cleanupCurrentObjectUrl();
+    setIsAnalyzing(false);
 
     const newObjectUrl = URL.createObjectURL(file);
     currentObjectUrlRef.current = newObjectUrl;
@@ -169,9 +182,12 @@ export const MediaUploadPreview: React.FC = () => {
   };
 
   const handleRemoveMedia = () => {
+    analysisGenerationRef.current += 1;
+    revokeReportPreview();
     cleanupCurrentObjectUrl();
     setSelectedMedia(null);
     setAnalysisReport(null);
+    setIsAnalyzing(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -205,6 +221,8 @@ export const MediaUploadPreview: React.FC = () => {
       validUrl = urlValidation.sanitizedUrl;
     }
 
+    const generation = ++analysisGenerationRef.current;
+    revokeReportPreview();
     setIsAnalyzing(true);
     setAnalysisReport(null);
     setAnalysisStep('Initiating multi-modal forensic inspection...');
@@ -215,10 +233,20 @@ export const MediaUploadPreview: React.FC = () => {
         file: selectedMedia?.file,
         mediaUrl: validUrl,
         onProgress: (stepMessage) => {
-          setAnalysisStep(stepMessage);
+          if (generation === analysisGenerationRef.current) {
+            setAnalysisStep(stepMessage);
+          }
         },
       });
 
+      if (generation !== analysisGenerationRef.current) {
+        if (report.previewUrl) {
+          URL.revokeObjectURL(report.previewUrl);
+        }
+        return;
+      }
+
+      reportPreviewUrlRef.current = report.previewUrl;
       setAnalysisReport(report);
 
       setTimeout(() => {
@@ -228,22 +256,30 @@ export const MediaUploadPreview: React.FC = () => {
         }
       }, 100);
     } catch (err: unknown) {
+      if (generation !== analysisGenerationRef.current) {
+        return;
+      }
       setActiveNotice({
         type: 'error',
         message: 'Analysis could not be completed.',
         subtext: (err as Error).message || 'An unexpected error occurred during client-side signal processing.',
       });
     } finally {
-      setIsAnalyzing(false);
+      if (generation === analysisGenerationRef.current) {
+        setIsAnalyzing(false);
+      }
     }
   };
 
   const handleReset = () => {
+    analysisGenerationRef.current += 1;
+    revokeReportPreview();
     setAnalysisReport(null);
     setSelectedMedia(null);
     setUrlInput('');
     cleanupCurrentObjectUrl();
     setActiveNotice(null);
+    setIsAnalyzing(false);
     setTimeout(() => {
       const analyzeEl = document.getElementById('analyze');
       if (analyzeEl) {
@@ -665,6 +701,7 @@ export const MediaUploadPreview: React.FC = () => {
       {/* Render Results Dashboard if Analysis Completed */}
       {analysisReport && (
         <ResultsDashboard
+          key={analysisReport.id}
           initialReport={analysisReport}
           onReset={handleReset}
         />

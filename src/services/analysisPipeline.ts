@@ -158,7 +158,7 @@ export const runTruthLensAnalysis = async (
   let audioResult: AudioAnalysisResult | undefined;
   let videoResult: VideoAnalysisResult | undefined;
 
-  let riskScore = 15;
+  let riskScore = 0;
   let riskLevel: UnifiedAnalysisReport['riskLevel'] = 'low';
   let riskLabel = 'Low Indicator Level';
   let measurementConfidence: UnifiedAnalysisReport['measurementConfidence'] = 'high';
@@ -205,7 +205,11 @@ export const runTruthLensAnalysis = async (
       { label: 'EXIF Metadata', value: imageResult.metrics.hasExifMetadata ? 'Detected' : 'Standard Web (None)' },
       { label: 'Luminance Mean', value: `${imageResult.metrics.luminanceMean} / 255` },
       { label: 'RMS Contrast', value: `${imageResult.metrics.contrastRms}` },
-      { label: 'Noise Discrepancy', value: `${imageResult.metrics.spatialVarianceDiscrepancy}:1` }
+      { label: 'Saturation', value: `${imageResult.metrics.meanSaturationPct}%` },
+      { label: 'Edge Density', value: `${imageResult.metrics.edgeDensityPct}%` },
+      { label: 'Mean Gradient', value: `${imageResult.metrics.meanGradient}` },
+      { label: 'Noise Discrepancy', value: `${imageResult.metrics.spatialVarianceDiscrepancy}:1` },
+      { label: 'Bytes / Pixel', value: `${imageResult.metrics.bytesPerPixel}` }
     );
     if (imageResult.metrics.experimentalCompressionDelta !== undefined) {
       summaryMetrics.push({

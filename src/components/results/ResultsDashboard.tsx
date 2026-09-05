@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   RotateCcw,
   Image as ImageIcon,
@@ -24,6 +24,11 @@ interface ResultsDashboardProps {
 export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ initialReport, onReset }) => {
   const [report, setReport] = useState<UnifiedAnalysisReport>(initialReport);
   const [activeTab, setActiveTab] = useState<'all' | 'detect' | 'understand' | 'verify'>('all');
+
+  useEffect(() => {
+    setReport(initialReport);
+    setActiveTab('all');
+  }, [initialReport]);
 
   const handleExplanationUpdated = (newExplanation: GenAIExplanation) => {
     setReport((prev) => ({

@@ -50,14 +50,20 @@ export interface ImageForensicMetrics {
   luminanceStdDev: number;
   contrastRms: number;          // Root Mean Square contrast
   channelDiscrepancy: number;   // Color divergence
+  meanSaturationPct: number;    // Average chroma (max-min RGB) as percent
   dynamicRangeClippingPct: number; // Percentage of pixels pinned at 0 or 255
 
   // Spatial Texture & Noise Consistency
   spatialNoiseVariance: number;
   spatialVarianceDiscrepancy: number; // Ratio between highest and lowest regional noise variance
+  meanGradient: number;
+  edgeDensityPct: number;
+  bytesPerPixel: number;
+  sourceFormat: 'jpeg' | 'png' | 'webp' | 'unknown';
 
-  // Experimental Compression Difference
+  // Experimental Compression Difference (JPEG sources only)
   experimentalCompressionDelta?: number;
+  compressionMetricApplicable: boolean;
 
   // Analysis Performance Documentation
   analysisResolution: string;   // e.g. "1024x768 (Analysis Copy)"

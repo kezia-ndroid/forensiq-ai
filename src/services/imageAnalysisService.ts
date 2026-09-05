@@ -29,6 +29,7 @@ import {
   evaluateMeasurementConfidence,
   inspectImageHeader,
 } from '../utils/imageForensics';
+import { DISCLAIMER_TEXT } from '../utils/constants';
 import { formatFileSize } from '../utils/mediaValidation';
 
 const MAX_ANALYSIS_DIMENSION = 1920; // Bound canvas size to avoid browser memory pressure
@@ -36,65 +37,128 @@ const MAX_ANALYSIS_DIMENSION = 1920; // Bound canvas size to avoid browser memor
 const clampScore = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
 
-/**
- * Conservative, deterministic Indicator Index from measured forensic characteristics.
- * Uses continuous contributions (not a fixed floor / binary jump table) so different
- * measurable images can yield different scores. Dimensions and missing EXIF add 0.
- */
-const computeImageIndicatorIndex = (input: {
+const pointsAbove = (value: number, threshold: number, scale: number, max: number): number =>
+  clampScore((value - threshold) * scale, 0, max);
+
+const pointsBelow = (value: number, threshold: number, scale: number, max: number): number =>
+  clampScore((threshold - value) * scale, 0, max);
+
+export interface ImageIndicatorIndexInput {
   spatialVarianceRatio: number;
   spatialNoiseVariance: number;
+  meanGradient: number;
+  edgeDensityPct: number;
   dynamicRangeClippingPct: number;
   rmsContrast: number;
+  luminanceMean: number;
   channelDiscrepancy: number;
+  meanSaturationPct: number;
   compressionDelta: number;
+  compressionApplicable: boolean;
   hasGenerativeSoftwareTags: boolean;
-  hasExif: boolean;
-}): {
+  aspectDecimal: number;
+  bytesPerPixel: number;
+  sourceFormat: 'jpeg' | 'png' | 'webp' | 'unknown';
+  megapixels: number;
+}
+
+export interface ImageIndicatorIndexBreakdown {
   score: number;
-  spatial: number;
+  spatialInconsistency: number;
   textureSmoothing: number;
+  oversmoothing: number;
+  edgeDeficit: number;
   clipping: number;
   lowContrast: number;
   lowChroma: number;
+  extremeLuminance: number;
+  packing: number;
+  extremeAspect: number;
   compression: number;
   generative: number;
-  exifRelief: number;
-} => {
-  const spatial = clampScore((input.spatialVarianceRatio - 1) * 1.6, 0, 20);
+}
+
+/**
+ * Deterministic Indicator Index from measured metrics only.
+ * Each signal is independently capped so one weak measurement cannot dominate.
+ * Common dimensions, filenames, missing EXIF, and inapplicable compression add 0.
+ */
+export const computeImageIndicatorIndex = (
+  input: ImageIndicatorIndexInput
+): ImageIndicatorIndexBreakdown => {
+  const spatialInconsistency = pointsAbove(input.spatialVarianceRatio, 3.8, 2.1, 16);
+
   const textureSmoothing =
-    input.spatialNoiseVariance < 18
-      ? clampScore((18 - input.spatialNoiseVariance) * 0.25, 0, 6)
+    input.spatialNoiseVariance < 10 ? pointsBelow(input.spatialNoiseVariance, 10, 0.45, 6) : 0;
+
+  const oversmoothing =
+    input.rmsContrast >= 0.13 && input.meanGradient < 9
+      ? pointsBelow(input.meanGradient, 9, 1.1, 12)
       : 0;
-  const clipping = clampScore(input.dynamicRangeClippingPct * 0.45, 0, 14);
-  const lowContrast =
-    input.rmsContrast < 0.22 ? clampScore((0.22 - input.rmsContrast) * 45, 0, 12) : 0;
+
+  const edgeDeficit =
+    input.rmsContrast >= 0.14 && input.edgeDensityPct < 7
+      ? pointsBelow(input.edgeDensityPct, 7, 1.15, 10)
+      : 0;
+
+  const clipping = pointsAbove(input.dynamicRangeClippingPct, 8, 0.55, 10);
+  const lowContrast = input.rmsContrast < 0.07 ? pointsBelow(input.rmsContrast, 0.07, 90, 8) : 0;
+
   const lowChroma =
-    input.channelDiscrepancy < 8 ? clampScore((8 - input.channelDiscrepancy) * 0.7, 0, 8) : 0;
-  const compression = clampScore(input.compressionDelta * 0.55, 0, 16);
-  const generative = input.hasGenerativeSoftwareTags ? 35 : 0;
-  const exifRelief = input.hasExif && !input.hasGenerativeSoftwareTags ? 5 : 0;
+    input.channelDiscrepancy < 3.5 && input.meanSaturationPct < 12
+      ? pointsBelow(input.channelDiscrepancy, 3.5, 1.4, 6)
+      : 0;
+
+  const extremeLuminance =
+    input.luminanceMean < 22
+      ? pointsBelow(input.luminanceMean, 22, 0.22, 5)
+      : input.luminanceMean > 235
+        ? pointsAbove(input.luminanceMean, 235, 0.28, 5)
+        : 0;
+
+  const packing =
+    input.sourceFormat === 'jpeg' && input.megapixels >= 0.4 && input.bytesPerPixel < 0.1
+      ? pointsBelow(input.bytesPerPixel, 0.1, 45, 6)
+      : 0;
+
+  const aspect = input.aspectDecimal >= 1 ? input.aspectDecimal : 1 / Math.max(input.aspectDecimal, 0.01);
+  const extremeAspect = aspect > 6 ? pointsAbove(aspect, 6, 1.2, 4) : 0;
+
+  const compression =
+    input.compressionApplicable
+      ? pointsAbove(input.compressionDelta, 6.5, 1.15, 10)
+      : 0;
+
+  const generative = input.hasGenerativeSoftwareTags ? 28 : 0;
 
   const raw =
-    spatial +
+    spatialInconsistency +
     textureSmoothing +
+    oversmoothing +
+    edgeDeficit +
     clipping +
     lowContrast +
     lowChroma +
+    extremeLuminance +
+    packing +
+    extremeAspect +
     compression +
-    generative -
-    exifRelief;
+    generative;
 
   return {
     score: Math.round(clampScore(raw, 0, 95)),
-    spatial: Math.round(spatial),
+    spatialInconsistency: Math.round(spatialInconsistency),
     textureSmoothing: Math.round(textureSmoothing),
+    oversmoothing: Math.round(oversmoothing),
+    edgeDeficit: Math.round(edgeDeficit),
     clipping: Math.round(clipping),
     lowContrast: Math.round(lowContrast),
     lowChroma: Math.round(lowChroma),
+    extremeLuminance: Math.round(extremeLuminance),
+    packing: Math.round(packing),
+    extremeAspect: Math.round(extremeAspect),
     compression: Math.round(compression),
     generative,
-    exifRelief,
   };
 };
 
@@ -110,7 +174,6 @@ export class ImageAnalysisError extends Error {
  */
 export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => {
   const startTime = performance.now();
-  const analysisId = `img_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
   if (!file) {
     throw new ImageAnalysisError('No file provided for image analysis', 'MISSING_FILE');
@@ -172,13 +235,29 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
     const lumResult = calculateLuminanceAndContrast(pixels);
     const colorResult = calculateColorChannelBalance(pixels);
     const spatialResult = calculateSpatialNoiseConsistency(pixels, renderWidth, renderHeight);
-    const compressionResult = await calculateExperimentalRecompressionDelta(canvas, ctx, renderWidth, renderHeight);
+    const compressionResult = await calculateExperimentalRecompressionDelta(
+      canvas,
+      ctx,
+      renderWidth,
+      renderHeight,
+      headerResult.format
+    );
     const confidenceAssessment = evaluateMeasurementConfidence(originalWidth, originalHeight, file.size);
 
     const megapixels = Math.round(((originalWidth * originalHeight) / 1_000_000) * 100) / 100;
     const aspectRatioStr = calculateAspectRatio(originalWidth, originalHeight);
+    const aspectDecimal = originalHeight > 0 ? originalWidth / originalHeight : 1;
+    const bytesPerPixel =
+      originalWidth > 0 && originalHeight > 0
+        ? Math.round((file.size / (originalWidth * originalHeight)) * 1000) / 1000
+        : 0;
+    const analysisCopyLabel =
+      renderWidth !== originalWidth || renderHeight !== originalHeight
+        ? `${renderWidth}x${renderHeight} (analysis copy)`
+        : `${renderWidth}x${renderHeight} (analysis copy, native scale)`;
+    const analysisId = `img_${file.size}_${originalWidth}x${originalHeight}_${Math.round(startTime)}`;
 
-    // 4. Assemble Measurable Metrics
+    // 4. Assemble Measurable Metrics (original file for size/header/dimensions; copy for pixels)
     const metrics: ImageForensicMetrics = {
       originalWidth,
       originalHeight,
@@ -195,11 +274,19 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
       luminanceStdDev: lumResult.stdDevLuminance,
       contrastRms: lumResult.rmsContrast,
       channelDiscrepancy: colorResult.channelDiscrepancy,
+      meanSaturationPct: colorResult.meanSaturationPct,
       dynamicRangeClippingPct: lumResult.dynamicRangeClippingPct,
       spatialNoiseVariance: spatialResult.overallVariance,
       spatialVarianceDiscrepancy: spatialResult.varianceRatio,
-      experimentalCompressionDelta: compressionResult.compressionDelta,
-      analysisResolution: `${renderWidth}x${renderHeight}${renderWidth !== originalWidth ? ' (Optimized)' : ' (Native)'}`,
+      meanGradient: spatialResult.meanGradient,
+      edgeDensityPct: spatialResult.edgeDensityPct,
+      bytesPerPixel,
+      sourceFormat: headerResult.format,
+      experimentalCompressionDelta: compressionResult.isApplicable
+        ? compressionResult.compressionDelta
+        : undefined,
+      compressionMetricApplicable: compressionResult.isApplicable,
+      analysisResolution: analysisCopyLabel,
       analysisDurationMs: Math.round(performance.now() - startTime),
     };
 
@@ -207,12 +294,20 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
     const indexBreakdown = computeImageIndicatorIndex({
       spatialVarianceRatio: spatialResult.varianceRatio,
       spatialNoiseVariance: spatialResult.overallVariance,
+      meanGradient: spatialResult.meanGradient,
+      edgeDensityPct: spatialResult.edgeDensityPct,
       dynamicRangeClippingPct: lumResult.dynamicRangeClippingPct,
       rmsContrast: lumResult.rmsContrast,
+      luminanceMean: lumResult.meanLuminance,
       channelDiscrepancy: colorResult.channelDiscrepancy,
+      meanSaturationPct: colorResult.meanSaturationPct,
       compressionDelta: compressionResult.compressionDelta,
+      compressionApplicable: compressionResult.isApplicable,
       hasGenerativeSoftwareTags: Boolean(headerResult.detectedSoftware && headerResult.detectedSoftware.length > 0),
-      hasExif: headerResult.hasExif,
+      aspectDecimal,
+      bytesPerPixel,
+      sourceFormat: headerResult.format,
+      megapixels,
     });
 
     const indicators: ImageIndicator[] = [];
@@ -225,7 +320,8 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         title: 'Generative Synthesis Metadata Detected',
         severity: 'warning',
         observedValue: headerResult.detectedSoftware.join(', '),
-        description: 'Textual parameters or diffusion workflow metadata chunks were identified in the file header.',
+        description:
+          'Observed characteristic: textual parameters or diffusion workflow chunks were identified in the file header. This is a potential indicator of a generative toolchain and needs verification; tags can also be injected or stripped.',
         limitationNote: 'Some metadata can be stripped or injected manually; must be cross-verified.',
         weightContribution: indexBreakdown.generative,
       });
@@ -238,7 +334,7 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         observedValue: 'EXIF APP1 Marker Found',
         description: 'File contains standard photographic exchangeable format markers typically written by camera hardware.',
         limitationNote: 'EXIF metadata can be forged or copied from real cameras onto synthetic media.',
-        weightContribution: -indexBreakdown.exifRelief,
+        weightContribution: 0,
       });
     } else {
       indicators.push({
@@ -254,28 +350,46 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
     }
 
     // Indicator B: Spatial Noise Consistency across Quadrants
-    const spatialWeight = indexBreakdown.spatial + indexBreakdown.textureSmoothing;
-    if (spatialResult.varianceRatio > 12.0) {
+    const spatialWeight = indexBreakdown.spatialInconsistency;
+    if (indexBreakdown.spatialInconsistency > 0) {
       indicators.push({
         id: 'spatial_noise_inconsistency',
         category: 'spatial_consistency',
-        title: 'Elevated Spatial Noise Discrepancy',
-        severity: 'caution',
+        title: 'Elevated Spatial Texture Discrepancy',
+        severity: indexBreakdown.spatialInconsistency >= 8 ? 'caution' : 'info',
         observedValue: `${spatialResult.varianceRatio.toFixed(1)}:1 regional ratio`,
-        description: 'Significant texture variance disparity detected between image quadrants. Could indicate selective smoothing, compositing, or varying generative focus.',
-        limitationNote: 'Legitimate photographic depth of field (bokeh) or macro backgrounds naturally cause noise variance.',
+        description:
+          'Observed characteristic: high-frequency texture variance differs substantially between image regions. This is a potential indicator of selective smoothing, compositing, or uneven processing — it needs verification against scene content such as bokeh.',
+        limitationNote: 'Legitimate photographic depth of field or mixed indoor/outdoor lighting naturally causes regional variance.',
         weightContribution: spatialWeight,
       });
     } else {
       indicators.push({
         id: 'spatial_noise_uniform',
         category: 'spatial_consistency',
-        title: 'Uniform Spatial Noise Distribution',
+        title: 'Regional Texture Distribution (Measured)',
         severity: 'info',
         observedValue: `${spatialResult.varianceRatio.toFixed(1)}:1 regional ratio`,
-        description: 'High-frequency gradient distribution is relatively consistent across image quadrants.',
+        description:
+          'Observed characteristic: high-frequency gradient energy is relatively consistent across quadrants. Uniform texture is common in authentic photographs and does not raise the Indicator Index by itself.',
         limitationNote: 'Uniform noise can occur naturally or be introduced by post-processing filters.',
-        weightContribution: spatialWeight,
+        weightContribution: 0,
+      });
+    }
+
+    const highFrequencyWeight =
+      indexBreakdown.oversmoothing + indexBreakdown.edgeDeficit + indexBreakdown.textureSmoothing;
+    if (highFrequencyWeight > 0) {
+      indicators.push({
+        id: 'spatial_edge_energy',
+        category: 'spatial_consistency',
+        title: 'Low High-Frequency / Edge Energy Relative to Contrast',
+        severity: highFrequencyWeight >= 10 ? 'caution' : 'info',
+        observedValue: `Gradient ${spatialResult.meanGradient.toFixed(2)}, edge density ${spatialResult.edgeDensityPct.toFixed(1)}%, noise var ${spatialResult.overallVariance.toFixed(1)}`,
+        description:
+          'Observed characteristic: local edge energy or high-frequency variance is low compared with measured luminance contrast. This is a potential indicator of smoothing, upscaling, or flattened texture and needs verification.',
+        limitationNote: 'Fog, shallow depth of field, and beauty filters produce similar edge suppression in authentic photos.',
+        weightContribution: highFrequencyWeight,
       });
     }
 
@@ -287,7 +401,8 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         title: 'High Extreme Dynamic Range Pinning',
         severity: 'caution',
         observedValue: `${lumResult.dynamicRangeClippingPct.toFixed(1)}% pixels at extremes`,
-        description: 'An elevated percentage of pixel values are pinned at pure white (255) or pure black (0), indicating severe clipping.',
+        description:
+          'Observed characteristic: an elevated share of pixels are pinned at pure white or pure black. This is a potential indicator of aggressive tone mapping or graphic compositing and needs verification.',
         limitationNote: 'Can result from natural harsh lighting, flash photography, or aggressive stylistic contrast adjustments.',
         weightContribution: indexBreakdown.clipping,
       });
@@ -298,7 +413,8 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         title: 'Measured Extreme-Value Pinning',
         severity: 'info',
         observedValue: `${lumResult.dynamicRangeClippingPct.toFixed(1)}% pixels at extremes`,
-        description: 'A portion of pixels sit at pure black or pure white. This is common in high-contrast photography, graphics, and screenshots.',
+        description:
+          'Observed characteristic: a measurable share of pixels sit at luminance extremes. Clipping is included only when it exceeds a conservative threshold.',
         limitationNote: 'Clipping is a measurable luminance characteristic and is not proof of synthetic generation.',
         weightContribution: indexBreakdown.clipping,
       });
@@ -312,7 +428,8 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         title: 'Atypical Low RMS Contrast',
         severity: 'info',
         observedValue: `RMS ${lumResult.rmsContrast.toFixed(3)}`,
-        description: 'Observed contrast across luminance channels is unusually narrow, characteristic of heavy fog, washed flat shading, or certain synthetic latent spaces.',
+        description:
+          'Observed characteristic: RMS luminance contrast is unusually narrow. This can appear in washed shading, heavy haze, or some synthetic palettes and needs verification.',
         limitationNote: 'Artistic color grading and overcast outdoor scenes frequently produce low contrast.',
         weightContribution: indexBreakdown.lowContrast,
       });
@@ -323,7 +440,8 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         title: 'Measured RMS Contrast',
         severity: 'info',
         observedValue: `RMS ${lumResult.rmsContrast.toFixed(3)}`,
-        description: 'Luminance contrast is included in the indicator index as a continuous photometric measurement.',
+        description:
+          'Observed characteristic: measured RMS contrast contributed a small, capped amount to the Indicator Index.',
         limitationNote: 'Lower contrast can occur in authentic overcast, fog, or graded photographs.',
         weightContribution: indexBreakdown.lowContrast,
       });
@@ -336,47 +454,105 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
         category: 'pixel_statistics',
         title: 'Low Inter-Channel Color Divergence',
         severity: 'info',
-        observedValue: `Mean RGB spread ${colorResult.channelDiscrepancy.toFixed(1)}`,
-        description: 'Average difference between R, G, and B channels is relatively small, indicating a more neutral or desaturated palette.',
+        observedValue: `RGB spread ${colorResult.channelDiscrepancy.toFixed(1)}, saturation ${colorResult.meanSaturationPct.toFixed(1)}%`,
+        description:
+          'Observed characteristic: inter-channel color divergence and saturation are both low (neutral/desaturated palette). This is a weak potential indicator and needs verification.',
         limitationNote: 'Grayscale conversion, tungsten lighting, and many authentic photos also exhibit low channel spread.',
         weightContribution: indexBreakdown.lowChroma,
       });
     }
 
-    // Indicator E: Experimental Recompression Difference
-    if (compressionResult.compressionDelta > 14.0) {
+    if (indexBreakdown.extremeLuminance > 0) {
+      indicators.push({
+        id: 'pixel_extreme_luminance',
+        category: 'pixel_statistics',
+        title: 'Extreme Mean Luminance',
+        severity: 'info',
+        observedValue: `Mean ${lumResult.meanLuminance.toFixed(1)} / 255`,
+        description:
+          'Observed characteristic: average luminance sits near black or near white. Treated as a weak photometric signal, not proof of origin.',
+        limitationNote: 'Night photography, snow scenes, and studio backdrops commonly produce extreme means.',
+        weightContribution: indexBreakdown.extremeLuminance,
+      });
+    }
+
+    // Indicator E: Experimental Recompression Difference (JPEG only)
+    if (!compressionResult.isApplicable) {
+      indicators.push({
+        id: 'compression_not_applicable',
+        category: 'experimental_compression',
+        title: 'Recompression Difference Not Applied',
+        severity: 'info',
+        observedValue: `${headerResult.format.toUpperCase()} source`,
+        description:
+          'Experimental JPEG recompression comparison is not applied to this container. Re-encoding PNG or WebP to JPEG is not a technically reliable comparison.',
+        limitationNote: 'Only original JPEG bitstreams are scored on this experimental metric.',
+        weightContribution: 0,
+      });
+    } else if (indexBreakdown.compression > 0) {
       indicators.push({
         id: 'compression_recompression_delta',
         category: 'experimental_compression',
-        title: 'High Recompression Residual Delta (Experimental)',
-        severity: 'caution',
+        title: 'Elevated Recompression Residual (Experimental)',
+        severity: indexBreakdown.compression >= 6 ? 'caution' : 'info',
         observedValue: `Delta ${compressionResult.compressionDelta.toFixed(2)}`,
-        description: 'Secondary compression produces noticeable high-frequency pixel deviations. May reflect unusual compression history or synthetic quantization.',
-        limitationNote: 'Experimental client-side metric. Multiple re-saves or uncompressed PNG conversions can elevate this score legitimately.',
+        description:
+          'Observed characteristic: a second JPEG encode produced larger-than-typical residuals. This is a potential compression-history indicator and needs verification.',
+        limitationNote: 'Experimental client-side metric. Multiple re-saves can elevate this value on authentic photos.',
         weightContribution: indexBreakdown.compression,
       });
     } else {
       indicators.push({
         id: 'compression_recompression_stable',
         category: 'experimental_compression',
-        title: 'Stable Recompression Gradient (Experimental)',
+        title: 'Stable JPEG Recompression Residual (Experimental)',
         severity: 'info',
         observedValue: `Delta ${compressionResult.compressionDelta.toFixed(2)}`,
-        description: 'Secondary compression error lies within normal expected bounds for standard web imagery.',
+        description:
+          'Observed characteristic: secondary JPEG encode residuals stayed below the scoring threshold for this experimental metric.',
         limitationNote: 'Experimental client-side metric for contextual reference only.',
-        weightContribution: indexBreakdown.compression,
+        weightContribution: 0,
       });
     }
 
-    // Indicator F: Factual Dimension Documentation (Explicitly 0 risk points)
+    if (indexBreakdown.packing > 0) {
+      indicators.push({
+        id: 'meta_packing_density',
+        category: 'metadata',
+        title: 'Low JPEG Bytes-Per-Pixel Packing',
+        severity: 'info',
+        observedValue: `${bytesPerPixel.toFixed(3)} B/px`,
+        description:
+          'Observed characteristic: file size is small relative to pixel count on a JPEG. This can reflect heavy recompression and is a weak potential indicator.',
+        limitationNote: 'Social networks routinely recompress authentic photographs to similar densities.',
+        weightContribution: indexBreakdown.packing,
+      });
+    }
+
+    if (indexBreakdown.extremeAspect > 0) {
+      indicators.push({
+        id: 'meta_extreme_aspect',
+        category: 'metadata',
+        title: 'Extreme Aspect Ratio',
+        severity: 'info',
+        observedValue: `${originalWidth} × ${originalHeight} (${aspectRatioStr})`,
+        description:
+          'Observed characteristic: the measured aspect ratio is unusually elongated. Common square or 16:9 sizes are not treated as generative evidence.',
+        limitationNote: 'Panoramas, banners, and crops produce extreme ratios in authentic media.',
+        weightContribution: indexBreakdown.extremeAspect,
+      });
+    }
+
+    // Indicator F: Factual Dimension Documentation (common sizes add 0)
     indicators.push({
       id: 'meta_dimensions_factual',
       category: 'metadata',
       title: 'Factual Resolution & Aspect Ratio',
       severity: 'info',
       observedValue: `${originalWidth} × ${originalHeight} (${aspectRatioStr})`,
-      description: `Natural image dimensions measured at ${megapixels} Megapixels.`,
-      limitationNote: 'Resolution is strictly factual metadata and does not contribute to the risk score.',
+      description: `Original decoded dimensions measured at ${megapixels} MP. Pixel statistics used a controlled analysis copy at ${analysisCopyLabel}.`,
+      limitationNote:
+        'Resolution and common generative canvas sizes (for example 1024×1024) do not contribute to the Indicator Index.',
       weightContribution: 0,
     });
 
@@ -399,21 +575,19 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
       riskLabel = 'Low Indicator Level';
     }
 
-    // 7. Evidence Summary & Recommendations
+    const scoredFactors = indicators
+      .filter((item) => item.weightContribution > 0)
+      .map((item) => `${item.title} (+${item.weightContribution})`);
+
     let evidenceSummary = '';
-    if (riskLevel === 'elevated') {
-      evidenceSummary = `Observed ${indicators.filter((i) => i.severity !== 'info').length} elevated indicators, including ${
-        headerResult.detectedSoftware ? 'synthetic software tags' : 'spatial noise or recompression anomalies'
-      }. Further provenance checking is strongly recommended.`;
-    } else if (riskLevel === 'moderate') {
+    if (riskLevel === 'inconclusive') {
       evidenceSummary =
-        'Observed several atypical characteristics (such as dynamic range clipping or spatial variance) that warrant caution, though they can also occur in authentic modified photos.';
-    } else if (riskLevel === 'inconclusive') {
-      evidenceSummary =
-        'Image resolution or file size is too low to reliably measure sensor noise patterns. Evidence is inconclusive.';
+        'Measurement reliability is limited by resolution or file size, so the Indicator Index should be treated as incomplete. Needs verification with a higher-quality original.';
+    } else if (scoredFactors.length > 0) {
+      evidenceSummary = `The Indicator Index (${finalRiskScore}/100) was raised by these measured characteristics: ${scoredFactors.join('; ')}. These are potential indicators, not proof of origin, and need verification.`;
     } else {
       evidenceSummary =
-        'Measured statistical metrics, spatial distribution, and compression characteristics fall largely within typical ranges. No strong anomalies detected.';
+        'No scored anomalies were added from the measured luminance, color, edge, spatial, packing, or header characteristics. Observed values stayed within conservative thresholds. This does not prove the image is authentic.';
     }
 
     const recommendations = [
@@ -423,8 +597,7 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
       'Do not rely solely on automated indicators when determining authenticity.',
     ];
 
-    const disclaimer =
-      'TruthLens AI provides experimental media analysis and verification guidance. Its indicators do not prove that media is authentic or AI-generated. Always verify important information with reliable sources.';
+    const disclaimer = DISCLAIMER_TEXT;
 
     return {
       analysisId,
@@ -442,12 +615,12 @@ export const analyzeImage = async (file: File): Promise<ImageAnalysisResult> => 
       evidenceSummary,
       whatThisMeans:
         riskLevel === 'elevated'
-          ? 'The analysis identified multiple forensic characteristics that deviate from typical photographic baselines. While not definitive proof of AI generation, this media warrants careful verification before trusting or sharing.'
+          ? 'Several observed characteristics sit outside conservative photographic thresholds. This is not a determination that the image is AI-generated. Treat the findings as potential indicators and verify provenance before trusting or sharing.'
           : riskLevel === 'moderate'
-          ? 'Some forensic characteristics deviate mildly from reference baselines. These can stem from compression, post-processing filters, or partial synthetic manipulation.'
+          ? 'Some observed characteristics deviate from typical ranges. Compression, grading, or capture conditions can produce the same measurements. Needs verification; not a claim of synthetic origin.'
           : riskLevel === 'inconclusive'
-          ? 'Due to constrained resolution or low sampling fidelity, forensic indicators could not be measured with high confidence.'
-          : 'Forensic indicators did not reveal prominent synthetic generation artifacts. However, sophisticated synthetic media or subtle edits may evade client-side heuristics.',
+          ? 'Sampling fidelity was too limited for a reliable reading. Confidence here describes measurement quality, not likelihood of AI generation.'
+          : 'Measured characteristics did not accumulate a high Indicator Index. Sophisticated synthetic media can still look ordinary under client-side heuristics, so this is not a claim that the image is real.',
       recommendations,
       disclaimer,
     };
